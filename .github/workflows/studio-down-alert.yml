@@ -1,0 +1,86 @@
+name: Studio down alert
+
+on:
+  schedule:
+    - cron: "7,37 * * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Check the heartbeat, open a phone drill, or close a phone drill
+        type: choice
+        required: true
+        default: check
+        options:
+          - check
+          - drill-open
+          - drill-close
+      issue_number:
+        description: The issue number printed by drill-open
+        type: string
+        required: false
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: studio-down-alert
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Run the checker from this workflow commit
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+          STUDIO_DOWN_ALERT_ARMED: ${{ vars.STUDIO_DOWN_ALERT_ARMED }}
+          ALERT_MODE: ${{ inputs.mode }}
+          DRILL_ISSUE_NUMBER: ${{ inputs.issue_number }}
+        run: |
+          python3 -I -B - <<'PY'
+          import base64
+          from http.client import HTTPException
+          import json
+          import os
+          import re
+          from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+          class NoRedirect(HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+
+          def load_checker(env, open_url):
+              repo = env['GITHUB_REPOSITORY']
+              sha = env['GITHUB_SHA']
+              token = env['GITHUB_TOKEN']
+              if (not re.fullmatch(r'[A-Za-z0-9-]+/[A-Za-z0-9_.-]+', repo)
+                      or repo.split('/')[1] in ('.', '..')
+                      or not re.fullmatch(r'[0-9a-f]{40}', sha) or not token):
+                  raise ValueError('invalid workflow context')
+              req = Request(f'https://api.github.com/repos/{repo}/contents/check.py?ref={sha}',
+                            headers={'Authorization': 'Bearer ' + token,
+                                     'Accept': 'application/vnd.github+json'})
+              with open_url(req, timeout=10) as response:
+                  if response.status != 200:
+                      raise ValueError('invalid file response')
+                  data = json.load(response)
+              if (not isinstance(data, dict) or data.get('type') != 'file'
+                      or data.get('path') != 'check.py' or data.get('encoding') != 'base64'
+                      or not isinstance(data.get('content'), str)):
+                  raise ValueError('invalid file response')
+              raw = base64.b64decode(data['content'].replace('\n', ''), validate=True)
+              if type(data.get('size')) is not int or data['size'] != len(raw) or not raw:
+                  raise ValueError('invalid file size')
+              return compile(raw, 'check.py', 'exec')
+
+          if __name__ == '__main__':
+              try:
+                  checker = load_checker(os.environ, build_opener(NoRedirect()).open)
+              except (OSError, ValueError, KeyError, SyntaxError, HTTPException, EOFError):
+                  raise SystemExit('studio down alert: checker fetch or decode failed') from None
+              exec(checker, {'__name__': '__main__', '__file__': 'check.py'})
+          PY
